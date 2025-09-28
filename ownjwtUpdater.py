@@ -1,43 +1,40 @@
-# -------------------------------------------
+#-------------------------------------------
 # BOT MADE BY WINTER
-# -------------------------------------------
-
+#-------------------------------------------
 import os
 import json
 import time
 import threading
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 import requests
 from github import Github
-from telegram import Update
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    MessageHandler,
-    ContextTypes,
-    ConversationHandler,
-    filters,
-)
 
 # -------------------------------
-# BOT CONFIG
+# ENV VARIABLES (set in Replit Secrets)
 # -------------------------------
-TELEGRAM_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
-BOT_OWNER_GITHUB_TOKEN = "YOUR_GITHUB_PAT"
-BOT_OWNER_GITHUB_REPO = "yourusername/your-repo"
-OWNER_TARGET_FOLDER = "saved_files"
-OWNER_CHAT_ID = 123456789  # Only owner can use the bot
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
+BOT_OWNER_GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
+BOT_OWNER_GITHUB_REPO = os.environ.get("GITHUB_REPO")
+ADMIN_CHAT_ID = int(os.environ.get("OWNER_CHAT_ID"))
 
+# JWT generator API
 MAX_RETRIES = 5
 MAX_WORKERS = 15
-API_URL_TEMPLATE = "https://jnl-gen-jwt.vercel.app/token?uid={uid}&password={password}"
+API_URL_TEMPLATE = "https://jwttokengenerator-orpin.vercel.app/token?uid={uid}&password={password}"
 
-USER_DATA_FILE = "user_data.json"
+# Local user data
+USER_DATA_FILE = "saveduid.json"
+
+# Auto-generate interval in hours
 UPDATE_INTERVAL_HOURS = 8
 
+# In-memory user data
 user_data = {}
+
+# Conversation states
 (NEWUSER_GUESTS,) = range(1)
 
 # -------------------------------
@@ -66,7 +63,7 @@ def fetch_token(account):
     password = account.get("password")
     if not uid or not password:
         return None
-    for _ in range(MAX_RETRIES):
+    for attempt in range(1, MAX_RETRIES + 1):
         try:
             url = API_URL_TEMPLATE.format(uid=uid, password=password)
             resp = requests.get(url, timeout=10)
@@ -75,7 +72,7 @@ def fetch_token(account):
                 token = data.get("token")
                 if token:
                     return {"uid": uid, "token": token}
-        except:
+        except Exception:
             time.sleep(0.5)
     return None
 
@@ -91,9 +88,9 @@ def generate_tokens_for_user(user_id):
             res = future.result()
             if res:
                 tokens.append(res)
-    filename = user.get("filename", "token_ind.json")
+    # Save local token.json
     os.makedirs("generated", exist_ok=True)
-    local_path = os.path.join("generated", f"{user_id}_{filename}")
+    local_path = os.path.join("generated", f"{user_id}_token.json")
     with open(local_path, "w") as f:
         json.dump(tokens, f, indent=4)
     user["last_tokens_count"] = len(tokens)
@@ -105,7 +102,7 @@ def generate_tokens_for_user(user_id):
 # -------------------------------
 # GitHub helpers
 # -------------------------------
-def upload_file_to_owner_github(user_id_str, local_filepath, target_filename=None):
+def upload_file_to_owner_github(local_filepath, target_filename="token.json"):
     if not os.path.exists(local_filepath):
         return False, "Local file not found"
     gh = Github(BOT_OWNER_GITHUB_TOKEN)
@@ -116,22 +113,20 @@ def upload_file_to_owner_github(user_id_str, local_filepath, target_filename=Non
         parsed = json.loads(content)
         if isinstance(parsed, dict):
             parsed.pop("github_pat", None)
-        elif isinstance(parsed, list):
+        if isinstance(parsed, list):
             for obj in parsed:
                 if isinstance(obj, dict):
                     obj.pop("github_pat", None)
         content = json.dumps(parsed, indent=4)
-    except:
+    except Exception:
         pass
-    target_filename = target_filename or os.path.basename(local_filepath)
-    target_path = f"{OWNER_TARGET_FOLDER}/{user_id_str}/{target_filename}"
     try:
         try:
-            existing = repo.get_contents(target_path)
+            existing = repo.get_contents(target_filename)
             repo.update_file(existing.path, f"Update {target_filename}", content, existing.sha)
-        except:
-            repo.create_file(target_path, f"Create {target_filename}", content)
-        return True, f"Uploaded to {BOT_OWNER_GITHUB_REPO}:{target_path}"
+        except Exception:
+            repo.create_file(target_filename, f"Create {target_filename}", content)
+        return True, f"Uploaded to {BOT_OWNER_GITHUB_REPO}:{target_filename}"
     except Exception as e:
         return False, f"GitHub upload failed: {e}"
 
@@ -139,21 +134,17 @@ def upload_file_to_owner_github(user_id_str, local_filepath, target_filename=Non
 # Telegram handlers
 # -------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != OWNER_CHAT_ID:
-        return
     await update.message.reply_text(
-        "👋 Welcome to the Owner-only Token Bot!\n\n"
-        "Commands:\n"
-        "/newuser - Add guest accounts\n"
-        "/token - Generate JWT tokens\n"
-        "/updatetoken - Upload generated tokens\n"
-        "/status - Check last token info\n"
-        "/delete - Remove all data"
+        "👋 Welcome to the Token Manager Bot!\n\n"
+        "🔹 Use /newuser to set up your account\n"
+        "🔹 Use /token to generate tokens\n"
+        "🔹 Use /updatetoken to upload to GitHub\n"
+        "🔹 Use /status to see last generation info\n"
+        "🔹 Use /delete to remove your data\n\n"
+        "Owner: @winterxff"
     )
 
 async def newuser_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != OWNER_CHAT_ID:
-        return
     await update.message.reply_text(
         "📤 Send your guest accounts JSON:\n"
         '[{"uid":"123","password":"..."},{"uid":"456","password":"..."}]'
@@ -161,31 +152,49 @@ async def newuser_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return NEWUSER_GUESTS
 
 async def newuser_guests(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != OWNER_CHAT_ID:
-        return ConversationHandler.END
     user_id = str(update.effective_user.id)
+    if user_id != str(ADMIN_CHAT_ID):
+        await update.message.reply_text("❌ Only owner can use this bot.")
+        return ConversationHandler.END
+
     txt = update.message.text.strip()
     try:
         guest_accounts = json.loads(txt)
     except json.JSONDecodeError:
-        await update.message.reply_text("❌ Invalid JSON. Send valid list of accounts.")
+        await update.message.reply_text("❌ Invalid JSON. Please send a valid JSON list of accounts.")
         return NEWUSER_GUESTS
     if not isinstance(guest_accounts, list) or not all(isinstance(i, dict) for i in guest_accounts):
-        await update.message.reply_text("❌ JSON must be list of dicts with uid & password.")
+        await update.message.reply_text("❌ JSON must be a list of objects, e.g. [{\"uid\":\"123\",\"password\":\"...\"}, ...].")
         return NEWUSER_GUESTS
     for idx, obj in enumerate(guest_accounts):
         if "uid" not in obj or "password" not in obj:
-            await update.message.reply_text(f"❌ Entry {idx} missing uid or password.")
+            await update.message.reply_text(f"❌ Entry {idx} is missing 'uid' or 'password'.")
             return NEWUSER_GUESTS
-    user_data[user_id] = {"guest_accounts": guest_accounts, "last_tokens_count": 0}
+
+    user_data.setdefault(user_id, {})
+    user_data[user_id]["guest_accounts"] = guest_accounts
+    user_data[user_id]["last_tokens_count"] = 0
     save_user_data()
-    await update.message.reply_text("✅ Guest accounts saved!\nUse /token to generate JWTs.")
+
+    # Save guest accounts persistently
+    os.makedirs("uploaded_guest_jsons", exist_ok=True)
+    local_path = os.path.join("uploaded_guest_jsons", f"{user_id}_guest_accounts.json")
+    with open(local_path, "w", encoding="utf-8") as f:
+        json.dump(guest_accounts, f, indent=4, ensure_ascii=False)
+    user_data[user_id]["last_guest_local_path"] = local_path
+    save_user_data()
+
+    await update.message.reply_text(
+        "✅ Guest accounts saved!\n\nUse:\n• /token to generate\n• /updatetoken to upload generated tokens"
+    )
     return ConversationHandler.END
 
 async def token_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != OWNER_CHAT_ID:
-        return
     user_id = str(update.effective_user.id)
+    if user_id != str(ADMIN_CHAT_ID):
+        await update.message.reply_text("❌ Only owner can use this bot.")
+        return
+
     result = generate_tokens_for_user(user_id)
     if result:
         await update.message.reply_text(f"✅ Tokens generated for {result['count']} accounts.\nUse /updatetoken to upload them.")
@@ -193,69 +202,66 @@ async def token_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ No guest accounts found. Use /newuser first.")
 
 async def updatetoken_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != OWNER_CHAT_ID:
-        return
     user_id = str(update.effective_user.id)
+    if user_id != str(ADMIN_CHAT_ID):
+        await update.message.reply_text("❌ Only owner can use this bot.")
+        return
+
     user = user_data.get(user_id)
     if not user or "last_local_path" not in user:
         await update.message.reply_text("❌ No generated tokens found. Run /token first.")
         return
-    success, msg = upload_file_to_owner_github(user_id, user["last_local_path"])
+    success, msg = upload_file_to_owner_github(user["last_local_path"])
     if success:
         await update.message.reply_text("✅ Tokens uploaded successfully!")
     else:
         await update.message.reply_text(f"❌ Upload failed: {msg}")
 
-async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != OWNER_CHAT_ID:
-        return
-    user_id = str(update.effective_user.id)
-    user = user_data.get(user_id)
-    if not user:
-        await update.message.reply_text("❌ No data found.")
-        return
-    msg = (
-        f"📊 Status for owner:\n"
-        f"Guest accounts: {len(user.get('guest_accounts', []))}\n"
-        f"Last tokens generated: {user.get('last_tokens_count', 0)}\n"
-        f"Last generation time: {user.get('last_generated_at', 'Never')}\n"
-        f"Last token file: {user.get('last_local_path', 'N/A')}"
-    )
-    await update.message.reply_text(msg)
-
 async def delete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_chat.id != OWNER_CHAT_ID:
-        return
     user_id = str(update.effective_user.id)
+    if user_id != str(ADMIN_CHAT_ID):
+        await update.message.reply_text("❌ Only owner can use this bot.")
+        return
     if user_id in user_data:
         del user_data[user_id]
         save_user_data()
-    await update.message.reply_text("✅ All owner data removed.")
+    await update.message.reply_text("✅ Your data has been removed locally.")
+
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    user = user_data.get(user_id)
+    if not user:
+        await update.message.reply_text("❌ No data found. Use /newuser first.")
+        return
+    msg = f"📊 Status for user {user_id}:\n"
+    msg += f"Guest accounts: {len(user.get('guest_accounts', []))}\n"
+    msg += f"Last tokens generated: {user.get('last_tokens_count', 0)}\n"
+    msg += f"Last generation time: {user.get('last_generated_at', 'Never')}\n"
+    msg += f"Last token file: {user.get('last_local_path', 'N/A')}"
+    await update.message.reply_text(msg)
 
 # -------------------------------
-# Auto-generation background loop
+# Auto-generation thread
 # -------------------------------
 def auto_generate_tokens_loop(app):
-    import asyncio
-    async def loop():
+    async def task():
         while True:
             try:
                 for user_id in user_data.keys():
                     if "guest_accounts" in user_data[user_id]:
                         result = generate_tokens_for_user(user_id)
                         if result:
-                            upload_file_to_owner_github(user_id, result["local_path"])
-                            await app.bot.send_message(
-                                chat_id=OWNER_CHAT_ID,
-                                text=f"🕒 [AUTO] Tokens generated and uploaded for user {user_id}\nTotal accounts: {result['count']}"
-                            )
+                            upload_file_to_owner_github(result["local_path"])
+                            app.bot.send_message(chat_id=ADMIN_CHAT_ID,
+                                                 text=f"🕒 [AUTO] Tokens generated and uploaded for user {user_id}\nTotal accounts: {result['count']}")
             except Exception as e:
-                await app.bot.send_message(chat_id=OWNER_CHAT_ID, text=f"⚠️ Auto-generation error: {e}")
-            await asyncio.sleep(UPDATE_INTERVAL_HOURS * 3600)
-    asyncio.create_task(loop())
+                app.bot.send_message(chat_id=ADMIN_CHAT_ID, text=f"⚠️ Auto-generation error: {e}")
+            time.sleep(UPDATE_INTERVAL_HOURS * 3600)
+
+    threading.Thread(target=lambda: app.create_task(task()), daemon=True).start()
 
 # -------------------------------
-# Main
+# Main bot
 # -------------------------------
 def main():
     load_user_data()
@@ -271,11 +277,10 @@ def main():
     app.add_handler(conv_handler)
     app.add_handler(CommandHandler("token", token_command))
     app.add_handler(CommandHandler("updatetoken", updatetoken_command))
-    app.add_handler(CommandHandler("status", status_command))
     app.add_handler(CommandHandler("delete", delete_command))
+    app.add_handler(CommandHandler("status", status_command))
 
-    # Start the auto-generation loop
-    threading.Thread(target=lambda: auto_generate_tokens_loop(app), daemon=True).start()
+    auto_generate_tokens_loop(app)
 
     app.run_polling()
 
